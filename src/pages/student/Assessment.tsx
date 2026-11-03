@@ -4,7 +4,8 @@ import AppShell from '../../components/AppShell'
 import { BobyMark } from '../../components/Boby'
 import { SuccessCheck, Tabs, Thinking } from '../../components/ui'
 import { Link } from '../../lib/router'
-import { queueTask as T } from '../../lib/data'
+import { queueTask as demoTask } from '../../lib/data'
+import { api, json, startAttempt, type Attempt, type SessionDetail, type TurnResult } from '../../lib/api'
 
 const MIN = 20
 type Msg = { who: 'boby' | 'mhs'; text: string; trap?: boolean; choice?: string; voice?: boolean }
@@ -46,12 +47,12 @@ function Stepper({ stage }: { stage: number }) {
   )
 }
 
-export default function Assessment({ path }: { path: string; id: string }) {
+export default function Assessment({ path, id }: { path: string; id: string }) {
   const [stage, setStage] = useState(0)          // 0 praktik · 1 reverse-tutor · 2 penerapan · 3 terkirim
   const [dir, setDir] = useState<'fwd' | 'back'>('fwd')
-  const [code, setCode] = useState(T.code)
-  const [explain, setExplain] = useState(T.explain)
-  const [msgs, setMsgs] = useState<Msg[]>([{ who: 'boby', text: T.boby[0] }])
+  const [code, setCode] = useState(id === demoTask.id ? demoTask.code : '')
+  const [explain, setExplain] = useState(id === demoTask.id ? demoTask.explain : '')
+  const [msgs, setMsgs] = useState<Msg[]>([])
   const [typing, setTyping] = useState(false)
   const [draft, setDraft] = useState('')
   const [choice, setChoice] = useState<string | null>(null)
@@ -59,37 +60,95 @@ export default function Assessment({ path }: { path: string; id: string }) {
   const [recording, setRecording] = useState(false)
   const [fromVoice, setFromVoice] = useState(false)
   const [apply, setApply] = useState(['', ''])
+  const [session, setSession] = useState<SessionDetail | null>(null)
+  const [attemptId, setAttemptId] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [serverMode, setServerMode] = useState<'live'|'scripted'|null>(null)
+  const [fallback, setFallback] = useState(false)
+  const [reviewed, setReviewed] = useState(false)
   const chat = useRef<HTMLDivElement>(null)
+  const T = { ...demoTask, ...(session || {}), className: session?.classId || demoTask.className }
+
+  useEffect(() => {
+    let active = true
+    const init = async () => {
+      const detail = await api<SessionDetail>('mahasiswa', `/sessions/${encodeURIComponent(id)}`)
+      const listing = await api<{active: {id:string;attempt?: {id:string;state:string}|null}[]}>('mahasiswa', '/me/sessions')
+      const existing = listing.active.find(s => s.id === id)?.attempt
+      if (existing && existing.state !== 'berlangsung') {
+        if (active) { setSession(detail); setAttemptId(existing.id); setReviewed(existing.state === 'selesai'); setStage(3) }
+        return
+      }
+      const started = await startAttempt(id)
+      const attempt = await api<Attempt>('mahasiswa', `/attempts/${started.attemptId}`)
+      if (!active) return
+      setSession(detail); setAttemptId(started.attemptId)
+      setApply(detail.penerapan.map((_, i) => attempt.answers?.[i] || ''))
+      if (attempt.code) setCode(attempt.code)
+      if (attempt.explain) setExplain(attempt.explain)
+      if (attempt.dialog?.length) {
+        setMsgs(attempt.dialog)
+        setStage(attempt.dialog.filter(m => m.who === 'mhs').length >= 3 ? 2 : 1)
+      }
+    }
+    init().catch(e => {if (active) setError(e.message)})
+    return () => {active = false}
+  }, [id])
 
   const answered = msgs.filter((m) => m.who === 'mhs').length
-  const onTrap = answered === 1                     // Boby's 2nd turn is the test statement
+  const onTrap = Boolean(msgs[msgs.length - 1]?.trap)
   const finished = answered >= 3
-  const canSend = draft.trim().length >= MIN && (!onTrap || !!choice) && !typing
+  const canSend = draft.trim().length >= MIN && (!onTrap || !!choice) && !typing && !error
 
   const go = (n: number) => { setDir(n > stage ? 'fwd' : 'back'); setStage(n); window.scrollTo({ top: 0, behavior: 'smooth' }) }
   useEffect(() => { chat.current?.scrollTo({ top: chat.current.scrollHeight, behavior: 'smooth' }) }, [msgs, typing])
 
-  const send = () => {
-    if (!canSend) return
-    const next: Msg[] = [...msgs, { who: 'mhs', text: draft.trim(), choice: onTrap ? choice! : undefined, voice: fromVoice }]
-    setMsgs(next); setDraft(''); setChoice(null); setFromVoice(false)
-    const k = next.filter((m) => m.who === 'mhs').length
-    setTyping(true)
-    setTimeout(() => {
-      setTyping(false)
-      setMsgs((m) => [...m, k < 3 ? { who: 'boby', text: T.boby[k], trap: k === 1 } : { who: 'boby', text: 'Terima kasih, aku jadi lebih paham bedanya! Sekarang coba dua soal penerapan, ya.' }])
-    }, 1100)
+  const beginBoby = async () => {
+    if (busy) return
+    setBusy(true); setError('')
+    try {
+      await api('mahasiswa', `/attempts/${attemptId}/practice`, json('PUT',{code,explain}))
+      const result = await api<TurnResult>('mahasiswa', `/attempts/${attemptId}/boby/turn`,json('POST',{}))
+      if (!result.turn) throw new Error('Pertanyaan Boby belum tersedia.')
+      setServerMode(result.mode); setFallback(result.usedFallback); setMsgs([result.turn]); go(1)
+    } catch (e) { setError((e instanceof Error ? e.message : 'Tidak dapat memulai sesi.') + ' Muat ulang sesi untuk memeriksa status.') }
+    finally { setBusy(false) }
+  }
+  const send = async () => {
+    if (!canSend || busy) return
+    setBusy(true); setTyping(true); setError('')
+    try {
+      const answer = { text:draft.trim(), ...(onTrap ? {choice} : {}) }
+      const result = await api<TurnResult>('mahasiswa', `/attempts/${attemptId}/boby/turn`, json('POST',answer))
+      const next:Msg = {who:'mhs',text:answer.text,...(onTrap ? {choice:choice!} : {}),voice:fromVoice}
+      setMsgs(m => [...m,next,...(result.turn ? [result.turn] : [])])
+      setServerMode(result.mode); setFallback(result.usedFallback); setDraft(''); setChoice(null); setFromVoice(false)
+    } catch (e) {
+      // A request can be accepted by the server even if its response is lost. Reload to avoid duplicate replies.
+      setError((e instanceof Error ? e.message : 'Jawaban belum dapat dikirim.') + ' Muat ulang sesi untuk memeriksa status sebelum mencoba lagi.')
+    } finally { setTyping(false); setBusy(false) }
+  }
+  const submitAll = async () => {
+    if (busy) return
+    setBusy(true); setError('')
+    try {
+      await api('mahasiswa', `/attempts/${attemptId}/application`, json('PUT',{answers:apply}))
+      const result = await api<{analyst:string;mode:'live'|'scripted'}>('mahasiswa', `/attempts/${attemptId}/submit`,json('POST',{}))
+      setServerMode(result.mode); setFallback(result.analyst === 'fallback'); go(3)
+    } catch (e) { setError((e instanceof Error ? e.message : 'Jawaban belum dapat dikirim.') + ' Periksa status sesi sebelum mencoba lagi.') }
+    finally { setBusy(false) }
   }
   const record = () => {
     if (recording) return
     setRecording(true)
-    setTimeout(() => { setRecording(false); setDraft(T.sample[answered] ?? ''); setFromVoice(true); if (onTrap) setChoice('Tidak setuju') }, 2200)
+    setTimeout(() => { setRecording(false); setDraft(demoTask.sample[answered] ?? ''); setFromVoice(true) }, 2200)
   }
 
-  const cleared = stage === 0 ? 0 : answered === 0 ? 1 : answered < 3 ? 2 : 3
-  const focus = T.focus.map((f, i) => ({ ...f, state: i < cleared ? 'Sudah jelas' : i === cleared && stage === 1 ? 'Sedang ditinjau' : 'Berikutnya' }))
+  const focus = session?.indicators.map(f => ({concept:f.name, state:'Menunggu tinjauan'})) ?? []
   const stageState = (i: number) => (stage > i ? 'Selesai' : stage === i ? 'Sedang berlangsung' : 'Belum dimulai')
 
+  if (!session || !attemptId) return <AppShell role="mahasiswa" path={path} crumbs={[{label:'Ruang Mahasiswa',to:'/mahasiswa'},{label:'Ruang Asesmen'}]}><p role={error ? 'alert' : 'status'}>{error || 'Menyiapkan sesi…'}</p>{error && <button className="btn btn-secondary mt-4" onClick={() => window.location.reload()}>Coba lagi</button>}</AppShell>
   return (
     <AppShell role="mahasiswa" path={path} crumbs={[{ label: 'Ruang Mahasiswa', to: '/mahasiswa' }, { label: 'Sesi Belajar', to: '/mahasiswa/sesi' }, { label: 'Ruang Asesmen' }]}>
       <div className="flex flex-wrap items-start justify-between gap-4 mb-6">
@@ -98,11 +157,13 @@ export default function Assessment({ path }: { path: string; id: string }) {
           <p className="text-[15px] text-[#4E4B5E] mt-1">{T.title} · {T.className} · {T.type}</p>
         </div>
         <div className="flex items-center gap-4 text-[15px] text-muted">
-          <span className="inline-flex items-center gap-1.5"><Check size={15} className="text-plum" aria-hidden="true" /> Tersimpan otomatis</span>
+          <span className="inline-flex items-center gap-1.5"><Check size={15} className="text-plum" aria-hidden="true" /> Disimpan saat dikirim</span>
           <span className="tnum">Batas {T.due}</span>
         </div>
       </div>
       <div className="mb-6 max-w-[880px]"><Stepper stage={Math.min(stage, 3)} /></div>
+      {error && <p role="alert" className="mb-4 rounded-lg bg-mist p-3">{error} <button className="underline text-plum" onClick={() => window.location.reload()}>Muat ulang</button></p>}
+      {serverMode && <p className="mb-4 text-[13px] text-muted">{serverMode === 'scripted' ? 'Mode skrip · respons contoh' : 'Mode AI langsung'}{fallback ? ' · menggunakan respons cadangan' : ''}</p>}
 
       <div className="grid xl:grid-cols-[1fr_320px] gap-4 items-start">
         <div key={stage} className={dir === 'fwd' ? 't-step-fwd' : 't-step-back'}>
@@ -125,7 +186,7 @@ export default function Assessment({ path }: { path: string; id: string }) {
                   ))}
                 </ul>
                 <div className="mt-6 flex justify-end">
-                  <button className="btn btn-primary" disabled={code.trim().length <= 20 || explain.trim().length < MIN} onClick={() => go(1)}>Kirim dan lanjut ke Boby <ArrowRight size={16} aria-hidden="true" /></button>
+                  <button className="btn btn-primary" disabled={busy || !!error || code.trim().length <= 20 || explain.trim().length < MIN} onClick={() => void beginBoby()}>{busy ? 'Menyiapkan Boby…' : 'Kirim dan lanjut ke Boby'} <ArrowRight size={16} aria-hidden="true" /></button>
                 </div>
               </section>
             </div>
@@ -152,7 +213,7 @@ export default function Assessment({ path }: { path: string; id: string }) {
                 ) : (
                   <div key={i} className="flex justify-end t-reveal">
                     <div className="bubble-right bg-charcoal text-ivory px-4 py-3 text-[15px] leading-snug max-w-[80%]">
-                      {(m.choice || m.voice) && <span className="block text-[13px] font-semibold text-[#CBB6FF] mb-1">{[m.choice, m.voice && 'dari suara, sudah diperiksa'].filter(Boolean).join(' · ')}</span>}
+                      {(m.choice || m.voice) && <span className="block text-[13px] font-semibold text-[#CBB6FF] mb-1">{[m.choice, m.voice && 'jawaban contoh simulasi suara'].filter(Boolean).join(' · ')}</span>}
                       {m.text}
                     </div>
                   </div>
@@ -171,7 +232,7 @@ export default function Assessment({ path }: { path: string; id: string }) {
                 ) : (
                   <>
                     <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-                      <Tabs label="Cara menjawab" value={mode} onChange={setMode} tabs={[{ id: 'teks', label: <span className="inline-flex items-center gap-1.5"><Keyboard size={15} aria-hidden="true" />Teks</span> }, { id: 'suara', label: <span className="inline-flex items-center gap-1.5"><Mic size={15} aria-hidden="true" />Suara</span> }]} />
+                      <Tabs label="Cara menjawab" value={mode} onChange={setMode} tabs={[{ id: 'teks', label: <span className="inline-flex items-center gap-1.5"><Keyboard size={15} aria-hidden="true" />Teks</span> }, ...(id === demoTask.id ? [{ id: 'suara' as const, label: <span className="inline-flex items-center gap-1.5"><Mic size={15} aria-hidden="true" />Suara (simulasi)</span> }] : [])]} />
                       {onTrap && (
                         <div role="radiogroup" aria-label="Pilih sikapmu terhadap pernyataan Boby" className="flex gap-1.5">
                           {['Setuju', 'Tidak setuju'].map((c) => (
@@ -180,7 +241,7 @@ export default function Assessment({ path }: { path: string; id: string }) {
                         </div>
                       )}
                     </div>
-                    {mode === 'suara' && (
+                    {mode === 'suara' && id === demoTask.id && (
                       <div className="mb-3 flex items-center gap-4 rounded-lg bg-mist p-3">
                         <button onClick={record} className={`w-12 h-12 rounded-full grid place-content-center shrink-0 transition-colors duration-[250ms] ${recording ? 'bg-accent text-white' : 'bg-charcoal text-ivory hover:bg-black'}`} aria-label={recording ? 'Sedang merekam' : 'Mulai rekam jawaban'}>
                           {recording ? <Square size={16} fill="currentColor" /> : <Mic size={20} />}
@@ -189,7 +250,7 @@ export default function Assessment({ path }: { path: string; id: string }) {
                           <div className="flex items-center gap-[3px] h-8" aria-hidden="true">
                             {Array.from({ length: 28 }, (_, i) => <span key={i} className="wave w-[3px] rounded-full bg-accent" style={{ animationDelay: `${(i % 7) * 90}ms`, height: `${30 + ((i * 37) % 60)}%` }} />)}
                           </div>
-                        ) : <p className="text-[15px] text-[#4E4B5E]">Tekan untuk merekam. Transkripnya muncul di kotak jawaban dan bisa kamu perbaiki sebelum dikirim.</p>}
+                        ) : <p className="text-[15px] text-[#4E4B5E]">Simulasi suara: tombol mengisi jawaban contoh, belum merekam atau mentranskripsi suara.</p>}
                       </div>
                     )}
                     <label htmlFor="jawab-boby" className="sr-only">Jawabanmu untuk Boby</label>
@@ -198,11 +259,11 @@ export default function Assessment({ path }: { path: string; id: string }) {
                       placeholder={onTrap ? 'Pilih setuju atau tidak, lalu jelaskan alasanmu…' : 'Jelaskan dengan kata-katamu sendiri…'} aria-describedby="jawab-hint" />
                     <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
                       <p id="jawab-hint" className="text-[13px] text-muted tnum">
-                        {fromVoice ? 'Transkrip suara: periksa dulu sebelum mengirim. ' : ''}{Math.min(draft.trim().length, MIN)}/{MIN} karakter minimum{onTrap && !choice ? ' · pilih setuju atau tidak' : ''}
+                        {fromVoice ? 'Jawaban contoh dari simulasi suara: periksa sebelum mengirim. ' : ''}{Math.min(draft.trim().length, MIN)}/{MIN} karakter minimum{onTrap && !choice ? ' · pilih setuju atau tidak' : ''}
                       </p>
                       <div className="flex items-center gap-4">
-                        <button className="text-[15px] font-semibold text-plum hover:underline" onClick={() => { setDraft(T.sample[answered]); if (onTrap) setChoice('Tidak setuju') }}>Pakai contoh jawaban</button>
-                        <button className="btn btn-primary btn-sm" disabled={!canSend} onClick={send}>Kirim <Send size={15} aria-hidden="true" /></button>
+                        {id === demoTask.id && <button className="text-[15px] font-semibold text-plum hover:underline" onClick={() => { setDraft(demoTask.sample[answered]); if (onTrap) setChoice('Tidak setuju') }}>Pakai contoh jawaban</button>}
+                        <button className="btn btn-primary btn-sm" disabled={!canSend || busy} onClick={() => void send()}>Kirim <Send size={15} aria-hidden="true" /></button>
                       </div>
                     </div>
                   </>
@@ -224,8 +285,8 @@ export default function Assessment({ path }: { path: string; id: string }) {
               <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
                 <button className="btn btn-ghost btn-sm" onClick={() => go(1)}><ArrowLeft size={15} aria-hidden="true" /> Kembali ke klarifikasi</button>
                 <div className="flex items-center gap-4">
-                  <button className="text-[15px] font-semibold text-plum hover:underline" onClick={() => setApply(['Queue, karena penelepon yang menunggu paling lama harus dijawab lebih dulu.', 'Stack. Kembali pertama membuka halaman terakhir, Kembali kedua membuka halaman sebelumnya.'])}>Pakai contoh jawaban</button>
-                  <button className="btn btn-primary" disabled={apply.some((a) => a.trim().length < MIN)} onClick={() => go(3)}>Kirim semua jawaban <Send size={16} aria-hidden="true" /></button>
+                  {id === demoTask.id && <button className="text-[15px] font-semibold text-plum hover:underline" onClick={() => setApply(['Queue, karena penelepon yang menunggu paling lama harus dijawab lebih dulu.', 'Stack. Kembali pertama membuka halaman terakhir, Kembali kedua membuka halaman sebelumnya.'])}>Pakai contoh jawaban</button>}
+                  <button className="btn btn-primary" disabled={busy || !!error || apply.some((a) => a.trim().length < MIN)} onClick={() => void submitAll()}>{busy ? 'Mengirim…' : 'Kirim semua jawaban'} <Send size={16} aria-hidden="true" /></button>
                 </div>
               </div>
             </section>
@@ -234,12 +295,12 @@ export default function Assessment({ path }: { path: string; id: string }) {
           {stage === 3 && (
             <section className="card p-10 flex flex-col items-center text-center" aria-labelledby="done-h">
               <SuccessCheck size={64} />
-              <h2 id="done-h" className="mt-6 text-[25px] font-bold tracking-[-0.02em]">Jawabanmu terkirim</h2>
-              <p className="mt-3 text-[17px] text-[#4E4B5E]"><Thinking lines={['Mengirim jawaban…', 'Menyusun transkrip…', 'Menunggu tinjauan dosen']} /></p>
-              <p className="mt-4 text-[15px] text-[#4E4B5E] max-w-[52ch]">Dosen akan meninjau praktik, percakapanmu dengan Boby, dan soal penerapan. Umpan balik dan kegiatan penguatan, bila ada, muncul di Dashboard Belajar setelah itu.</p>
+              <h2 id="done-h" className="mt-6 text-[25px] font-bold tracking-[-0.02em]">{reviewed ? 'Sesi sudah ditinjau' : 'Jawabanmu terkirim'}</h2>
+              {!reviewed && <p className="mt-3 text-[17px] text-[#4E4B5E]"><Thinking lines={['Menunggu tinjauan dosen']} /></p>}
+              <p className="mt-4 text-[15px] text-[#4E4B5E] max-w-[52ch]">{reviewed ? 'Dosen sudah menyelesaikan tinjauan sesi ini.' : 'Dosen akan meninjau praktik, percakapanmu dengan Boby, dan soal penerapan.'}</p>
               <div className="mt-8 flex flex-wrap justify-center gap-3">
                 <Link to="/mahasiswa" className="btn btn-primary">Ke Dashboard Belajar</Link>
-                <Link to="/mahasiswa/ringkasan/stack-vs-queue" className="btn btn-secondary">Lihat contoh ringkasan</Link>
+                {reviewed && <Link to={`/mahasiswa/ringkasan/${id}`} className="btn btn-secondary">Lihat hasil</Link>}
               </div>
             </section>
           )}

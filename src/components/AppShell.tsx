@@ -30,6 +30,9 @@ const NAV: Record<Role, { to: string; label: string; short: string; icon: typeof
 export default function AppShell({ role, path, crumbs, children }: { role: Role; path: string; crumbs: { label: string; to?: string }[]; children: ReactNode }) {
   const user = role === 'dosen' ? { name: lecturer.name, sub: lecturer.role, seed: 3 } : { name: me.name, sub: `Mahasiswa · ${me.nim}`, seed: 0 }
   const other = role === 'dosen' ? { to: '/mahasiswa', label: 'Lihat sebagai mahasiswa' } : { to: '/dosen', label: 'Lihat sebagai dosen' }
+  const backendPage = role === 'mahasiswa'
+    ? (path === '/mahasiswa' || path === '/mahasiswa/sesi' || path.startsWith('/mahasiswa/sesi/') || path.startsWith('/mahasiswa/ringkasan/'))
+    : (path === '/dosen' || path === '/dosen/sesi' || path.startsWith('/dosen/tinjauan/'))
   const [guide, setGuide] = useState(false)
   // A first-time visitor gets a mark on the button rather than a sheet thrown over the screen; the
   // walkthrough opens when they ask for it. The mark goes once they have opened it.
@@ -85,7 +88,7 @@ export default function AppShell({ role, path, crumbs, children }: { role: Role;
               ))}
             </ol>
           </nav>
-          <span className="hidden md:inline text-[13px] text-muted">Purwarupa · data contoh</span>
+          <span className="hidden md:inline text-[13px] text-muted">{backendPage ? 'Mode demo · data server' : 'Contoh lokal · belum tersambung'}</span>
           <button data-tour="bantuan" onClick={() => setGuide(true)}
             className="relative flex items-center gap-1.5 h-9 px-3 rounded-[11px_3px_11px_11px] text-[15px] font-semibold text-plum hover:bg-mist transition-colors duration-150">
             <LifeBuoy size={16} strokeWidth={1.9} aria-hidden="true" /> Panduan

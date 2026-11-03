@@ -4,6 +4,7 @@ import { useGSAP } from '@gsap/react'
 import { ArrowRight, Eye, EyeOff, GraduationCap, Presentation } from 'lucide-react'
 import Boby, { BobyMark } from '../components/Boby'
 import { Link, go } from '../lib/router'
+import { login, type Role } from '../lib/api'
 import './login.css'
 
 /**
@@ -31,6 +32,13 @@ export default function Login() {
   const [note, setNote] = useState<string | null>(null)
   const [daftar, setDaftar] = useState(false)
   const [peran, setPeran] = useState<'mahasiswa' | 'dosen'>('mahasiswa')
+  const [demoBusy, setDemoBusy] = useState(false)
+  const openDemo = async (role: Role) => {
+    setDemoBusy(true); setNote(null)
+    try { await login(role); go('/' + role) }
+    catch (error) { setNote(error instanceof Error ? error.message : 'Tidak dapat masuk ke mode demo.') }
+    finally { setDemoBusy(false) }
+  }
   const claim = CLAIMS[i]
   const calm = typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches
 
@@ -138,12 +146,12 @@ export default function Login() {
           <div className="lg-or" data-in><span>atau coba tanpa akun</span></div>
 
           <div className="lg-demos" data-in>
-            <button className="lg-demo" onClick={() => go('/mahasiswa')}>
+            <button className="lg-demo" disabled={demoBusy} onClick={() => void openDemo('mahasiswa')}>
               <GraduationCap size={21} strokeWidth={1.75} aria-hidden="true" />
               <span><strong>Demo sebagai mahasiswa</strong>Kerjakan sesi dan ajari Boby</span>
               <ArrowRight size={18} aria-hidden="true" />
             </button>
-            <button className="lg-demo" onClick={() => go('/dosen')}>
+            <button className="lg-demo" disabled={demoBusy} onClick={() => void openDemo('dosen')}>
               <Presentation size={21} strokeWidth={1.75} aria-hidden="true" />
               <span><strong>Demo sebagai dosen</strong>Tinjau bukti dan tentukan pendampingan</span>
               <ArrowRight size={18} aria-hidden="true" />

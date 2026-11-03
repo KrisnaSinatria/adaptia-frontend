@@ -1,67 +1,37 @@
-import { useState } from 'react'
-import { ArrowRight } from 'lucide-react'
+import { useEffect, useState } from 'react'
 import AppShell, { TitleRow } from '../../components/AppShell'
-import { Tabs } from '../../components/ui'
 import { Link } from '../../lib/router'
-import { myDone, mySessions } from '../../lib/data'
+import { api, type ApiSession } from '../../lib/api'
 
 export function SessionTable({ headingId }: { headingId: string }) {
-  const [tab, setTab] = useState<'todo' | 'done'>('todo')
-  return (
-    <div className="card p-6">
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-        <h2 id={headingId} className="text-[17px] font-semibold">Sesi belajar</h2>
-        <Tabs label="Saring sesi" value={tab} onChange={setTab} tabs={[{ id: 'todo', label: `Perlu dikerjakan · ${mySessions.length}` }, { id: 'done', label: `Selesai · ${myDone.length}` }]} />
-      </div>
-      <div key={tab} className="t-swap overflow-x-auto">
-        {tab === 'todo' ? (
-          <table className="w-full text-[15px] sm:min-w-[620px]">
-            <thead><tr className="text-left text-[13px] text-muted"><th className="font-medium py-2">Sesi</th><th className="font-medium py-2 hidden md:table-cell">Format</th><th className="font-medium py-2 hidden sm:table-cell">Batas</th><th className="font-medium py-2 hidden sm:table-cell">Status</th><th className="py-2"><span className="sr-only">Aksi</span></th></tr></thead>
-            <tbody>
-              {mySessions.map((s) => (
-                <tr key={s.id} className="border-t border-line row-hover">
-                  <td className="py-3.5 pr-4"><p className="font-semibold">{s.title}</p><p className="text-[13px] text-muted">{s.className}</p><p className="sm:hidden text-[13px] text-muted tnum">Batas {s.due}</p></td>
-                  <td className="py-3.5 pr-4 hidden md:table-cell">{s.format}</td>
-                  <td className="py-3.5 pr-4 tnum hidden sm:table-cell">{s.due}</td>
-                  <td className="py-3.5 pr-4 hidden sm:table-cell"><span className={`pill ${s.stage ? 'pill-ok' : 'pill-none'}`}>{s.state}</span></td>
-                  <td className="py-3.5 text-right">
-                    {s.id === 'antrean-queue'
-                      ? <Link to={`/mahasiswa/sesi/${s.id}`} className="btn btn-sm btn-secondary">Lanjutkan <ArrowRight size={15} aria-hidden="true" /></Link>
-                      : <span className="text-[13px] text-muted">Dibuka 1 Nov</span>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        ) : (
-          <table className="w-full text-[15px] sm:min-w-[620px]">
-            <thead><tr className="text-left text-[13px] text-muted"><th className="font-medium py-2">Sesi</th><th className="font-medium py-2 hidden sm:table-cell">Dikirim</th><th className="font-medium py-2 hidden sm:table-cell">Status</th><th className="py-2"><span className="sr-only">Aksi</span></th></tr></thead>
-            <tbody>
-              {myDone.map((s) => (
-                <tr key={s.id} className="border-t border-line row-hover">
-                  <td className="py-3.5 pr-4"><p className="font-semibold">{s.title}</p><p className="text-[13px] text-muted">{s.className}</p></td>
-                  <td className="py-3.5 pr-4 tnum hidden sm:table-cell">{s.submitted}</td>
-                  <td className="py-3.5 pr-4 hidden sm:table-cell"><span className={`pill ${s.state === 'Sudah ditinjau' ? 'pill-ok' : 'pill-part'}`}>{s.state}</span></td>
-                  <td className="py-3.5 text-right">
-                    {s.id === 'stack-vs-queue'
-                      ? <Link to="/mahasiswa/ringkasan/stack-vs-queue" className="btn btn-sm btn-secondary">Lihat ringkasan</Link>
-                      : <span className="text-[13px] text-muted">{s.state === 'Sudah ditinjau' ? 'Ringkasan diarsipkan' : 'Umpan balik setelah ditinjau'}</span>}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-    </div>
-  )
+  const [data, setData] = useState<{active:ApiSession[]; history:ApiSession[]}|null>(null)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let active = true
+    api<{active:ApiSession[];history:ApiSession[]}>('mahasiswa','/me/sessions')
+      .then(x => {if(active) setData(x)}).catch(e => {if(active) setError(e.message)})
+    return () => {active=false}
+  }, [])
+  return <div className="card p-6"><h2 id={headingId} className="text-[17px] font-semibold">Sesi belajar</h2>
+    {error && <p role="alert" className="mt-3">{error}</p>}
+    {!data && !error && <p className="mt-3">Memuat sesi…</p>}
+    {data && <div className="mt-3">
+      {data.active.length === 0 && <p className="text-muted">Belum ada sesi aktif.</p>}
+      {data.active.map(s => <div key={s.id} className="border-t border-line py-3 flex flex-wrap items-center justify-between gap-2">
+        <div><p className="font-semibold">{s.title}</p><p className="text-muted text-[13px]">{s.type} · {s.format} · Batas {s.due}</p></div>
+        {s.attempt?.state === 'perlu' ? <span className="pill pill-part">Menunggu tinjauan</span> : s.attempt?.state === 'selesai' ? <Link to={`/mahasiswa/ringkasan/${s.id}`} className="btn btn-sm btn-secondary">Lihat hasil</Link> :
+          <Link to={`/mahasiswa/sesi/${s.id}`} className="btn btn-sm btn-secondary">{s.attempt?.state === 'berlangsung' ? 'Lanjutkan' : 'Mulai'}</Link>}
+      </div>)}
+      {data.history.length > 0 && <details className="mt-4"><summary className="cursor-pointer font-semibold">Riwayat sesi · {data.history.length}</summary>
+        {data.history.map(s => <p className="mt-2 text-muted" key={s.id}>{s.title} · {s.attempt?.state === 'selesai' ? <Link className="text-plum underline" to={`/mahasiswa/ringkasan/${s.id}`}>Lihat hasil yang ditinjau</Link> : s.attempt?.state === 'perlu' ? 'Menunggu tinjauan' : 'Sesi ditutup'}</p>)}
+      </details>}
+    </div>}
+  </div>
 }
 
-export default function StudentSessions({ path }: { path: string }) {
-  return (
-    <AppShell role="mahasiswa" path={path} crumbs={[{ label: 'Ruang Mahasiswa', to: '/mahasiswa' }, { label: 'Sesi Belajar' }]}>
-      <TitleRow title="Sesi Belajar" finding="Umpan balik setiap sesi muncul setelah dosen meninjau buktimu. Skor tidak ditampilkan sebelum itu." />
-      <div data-tour="daftar-sesi"><SessionTable headingId="sesi-list-h" /></div>
-    </AppShell>
-  )
+export default function StudentSessions({path}:{path:string}) {
+  return <AppShell role="mahasiswa" path={path} crumbs={[{label:'Ruang Mahasiswa',to:'/mahasiswa'},{label:'Sesi Belajar'}]}>
+    <TitleRow title="Sesi Belajar" finding="Umpan balik muncul setelah dosen meninjau bukti." />
+    <SessionTable headingId="sesi-list-h" />
+  </AppShell>
 }
