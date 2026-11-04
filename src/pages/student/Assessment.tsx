@@ -6,9 +6,21 @@ import { SuccessCheck, Tabs, Thinking } from '../../components/ui'
 import { Link } from '../../lib/router'
 import { queueTask as demoTask } from '../../lib/data'
 import { api, json, startAttempt, type Attempt, type SessionDetail, type TurnResult } from '../../lib/api'
+import { bobyRecovery } from '../../lib/api-errors'
+import { canSubmitPractice } from '../../lib/assessment-flow'
 
 const MIN = 20
 type Msg = { who: 'boby' | 'mhs'; text: string; trap?: boolean; choice?: string; voice?: boolean }
+type SpeechResult = { isFinal: boolean; 0: { transcript: string } }
+type SpeechEvent = { results: ArrayLike<SpeechResult> }
+type SpeechRecognitionInstance = {
+  lang: string; continuous: boolean; interimResults: boolean
+  onresult: ((event: SpeechEvent) => void) | null
+  onerror: ((event: { error: string }) => void) | null
+  onend: (() => void) | null
+  start: () => void; stop: () => void; abort: () => void
+}
+type SpeechRecognitionConstructor = new () => SpeechRecognitionInstance
 
 /** transitions.dev 30-style streaming: each word resolves through a soft cross-blur, 40ms apart. */
 function Streamed({ text }: { text: string }) {
@@ -50,19 +62,23 @@ function Stepper({ stage }: { stage: number }) {
 export default function Assessment({ path, id }: { path: string; id: string }) {
   const [stage, setStage] = useState(0)          // 0 praktik · 1 reverse-tutor · 2 penerapan · 3 terkirim
   const [dir, setDir] = useState<'fwd' | 'back'>('fwd')
-  const [code, setCode] = useState(id === demoTask.id ? demoTask.code : '')
-  const [explain, setExplain] = useState(id === demoTask.id ? demoTask.explain : '')
+  const [code, setCode] = useState('')
+  const [explain, setExplain] = useState('')
   const [msgs, setMsgs] = useState<Msg[]>([])
   const [typing, setTyping] = useState(false)
   const [draft, setDraft] = useState('')
   const [choice, setChoice] = useState<string | null>(null)
   const [mode, setMode] = useState<'teks' | 'suara'>('teks')
   const [recording, setRecording] = useState(false)
+  const [finalizingVoice, setFinalizingVoice] = useState(false)
+  const [voiceError, setVoiceError] = useState('')
   const [fromVoice, setFromVoice] = useState(false)
+  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null)
   const [apply, setApply] = useState(['', ''])
   const [session, setSession] = useState<SessionDetail | null>(null)
   const [attemptId, setAttemptId] = useState('')
   const [error, setError] = useState('')
+  const [recovery, setRecovery] = useState<'retry' | 'reload' | 'none'>('none')
   const [busy, setBusy] = useState(false)
   const [serverMode, setServerMode] = useState<'live'|'scripted'|null>(null)
   const [fallback, setFallback] = useState(false)
@@ -85,49 +101,63 @@ export default function Assessment({ path, id }: { path: string; id: string }) {
       if (!active) return
       setSession(detail); setAttemptId(started.attemptId)
       setApply(detail.penerapan.map((_, i) => attempt.answers?.[i] || ''))
-      if (attempt.code) setCode(attempt.code)
-      if (attempt.explain) setExplain(attempt.explain)
+      setCode(attempt.code || '')
+      setExplain(attempt.explain || '')
       if (attempt.dialog?.length) {
         setMsgs(attempt.dialog)
         setStage(attempt.dialog.filter(m => m.who === 'mhs').length >= 3 ? 2 : 1)
       }
     }
-    init().catch(e => {if (active) setError(e.message)})
+    init().catch(e => {if (active) { setError(e.message); setRecovery('reload') }})
     return () => {active = false}
   }, [id])
 
   const answered = msgs.filter((m) => m.who === 'mhs').length
   const onTrap = Boolean(msgs[msgs.length - 1]?.trap)
   const finished = answered >= 3
-  const canSend = draft.trim().length >= MIN && (!onTrap || !!choice) && !typing && !error
+  const practiceReady = canSubmitPractice(code, explain, MIN)
+  const canSendAnswer = draft.trim().length >= MIN && (!onTrap || !!choice) && !typing && !recording && !finalizingVoice
+  const canSend = canSendAnswer && !error
 
   const go = (n: number) => { setDir(n > stage ? 'fwd' : 'back'); setStage(n); window.scrollTo({ top: 0, behavior: 'smooth' }) }
   useEffect(() => { chat.current?.scrollTo({ top: chat.current.scrollHeight, behavior: 'smooth' }) }, [msgs, typing])
+  useEffect(() => () => {
+    const recognition = recognitionRef.current
+    if (recognition) {
+      recognition.onresult = null; recognition.onerror = null; recognition.onend = null
+      recognition.abort()
+    }
+  }, [])
+
+  const reportBobyError = (failure: unknown) => {
+    const action = bobyRecovery(failure)
+    setRecovery(action)
+    setError(action === 'retry' ? 'Boby belum bisa merespons. Coba lagi sebentar.'
+      : failure instanceof Error ? failure.message : 'Jawaban belum dapat dikirim.')
+  }
 
   const beginBoby = async () => {
-    if (busy) return
-    setBusy(true); setError('')
+    if (busy || !practiceReady) return
+    setBusy(true); setError(''); setRecovery('none')
     try {
       await api('mahasiswa', `/attempts/${attemptId}/practice`, json('PUT',{code,explain}))
       const result = await api<TurnResult>('mahasiswa', `/attempts/${attemptId}/boby/turn`,json('POST',{}))
       if (!result.turn) throw new Error('Pertanyaan Boby belum tersedia.')
       setServerMode(result.mode); setFallback(result.usedFallback); setMsgs([result.turn]); go(1)
-    } catch (e) { setError((e instanceof Error ? e.message : 'Tidak dapat memulai sesi.') + ' Muat ulang sesi untuk memeriksa status.') }
+    } catch (e) { reportBobyError(e) }
     finally { setBusy(false) }
   }
-  const send = async () => {
-    if (!canSend || busy) return
-    setBusy(true); setTyping(true); setError('')
+  const send = async (retry = false) => {
+    if ((retry ? !canSendAnswer : !canSend) || busy) return
+    setBusy(true); setTyping(true); setError(''); setRecovery('none')
     try {
       const answer = { text:draft.trim(), ...(onTrap ? {choice} : {}) }
       const result = await api<TurnResult>('mahasiswa', `/attempts/${attemptId}/boby/turn`, json('POST',answer))
       const next:Msg = {who:'mhs',text:answer.text,...(onTrap ? {choice:choice!} : {}),voice:fromVoice}
       setMsgs(m => [...m,next,...(result.turn ? [result.turn] : [])])
       setServerMode(result.mode); setFallback(result.usedFallback); setDraft(''); setChoice(null); setFromVoice(false)
-    } catch (e) {
-      // A request can be accepted by the server even if its response is lost. Reload to avoid duplicate replies.
-      setError((e instanceof Error ? e.message : 'Jawaban belum dapat dikirim.') + ' Muat ulang sesi untuk memeriksa status sebelum mencoba lagi.')
-    } finally { setTyping(false); setBusy(false) }
+    } catch (e) { reportBobyError(e) }
+    finally { setTyping(false); setBusy(false) }
   }
   const submitAll = async () => {
     if (busy) return
@@ -136,13 +166,47 @@ export default function Assessment({ path, id }: { path: string; id: string }) {
       await api('mahasiswa', `/attempts/${attemptId}/application`, json('PUT',{answers:apply}))
       const result = await api<{analyst:string;mode:'live'|'scripted'}>('mahasiswa', `/attempts/${attemptId}/submit`,json('POST',{}))
       setServerMode(result.mode); setFallback(result.analyst === 'fallback'); go(3)
-    } catch (e) { setError((e instanceof Error ? e.message : 'Jawaban belum dapat dikirim.') + ' Periksa status sesi sebelum mencoba lagi.') }
+    } catch (e) { setRecovery('reload'); setError((e instanceof Error ? e.message : 'Jawaban belum dapat dikirim.') + ' Periksa status sesi sebelum mencoba lagi.') }
     finally { setBusy(false) }
   }
   const record = () => {
-    if (recording) return
-    setRecording(true)
-    setTimeout(() => { setRecording(false); setDraft(demoTask.sample[answered] ?? ''); setFromVoice(true) }, 2200)
+    if (finalizingVoice) return
+    if (recording) {
+      setFinalizingVoice(true)
+      recognitionRef.current?.stop()
+      return
+    }
+    const browser = window as Window & { SpeechRecognition?: SpeechRecognitionConstructor; webkitSpeechRecognition?: SpeechRecognitionConstructor }
+    const Constructor = browser.SpeechRecognition || browser.webkitSpeechRecognition
+    if (!Constructor) { setVoiceError('Pengenalan suara tidak tersedia di browser ini. Gunakan Chrome atau ketik jawabanmu.'); return }
+    const recognition = new Constructor()
+    recognition.lang = 'id-ID'
+    recognition.continuous = true
+    recognition.interimResults = false
+    let transcript = ''
+    let failed = false
+    recognition.onresult = (event) => {
+      transcript = Array.from(event.results).filter(result => result.isFinal).map(result => result[0].transcript.trim()).join(' ').trim()
+    }
+    recognition.onerror = (event) => {
+      failed = true
+      setVoiceError(event.error === 'not-allowed' || event.error === 'service-not-allowed'
+        ? 'Izin mikrofon ditolak. Izinkan mikrofon di Chrome atau ketik jawabanmu.'
+        : event.error === 'no-speech' ? 'Suara belum terdengar. Coba rekam lagi.'
+        : 'Transkripsi suara gagal. Periksa koneksi internet, lalu coba lagi atau ketik jawabanmu.')
+    }
+    recognition.onend = () => {
+      if (!failed && transcript) {
+        setDraft(current => [current.trim(), transcript].filter(Boolean).join(' '))
+        setFromVoice(true)
+      } else if (!failed) setVoiceError('Tidak ada ucapan yang tertangkap. Coba rekam lagi.')
+      recognitionRef.current = null
+      setRecording(false)
+      setFinalizingVoice(false)
+    }
+    setVoiceError('')
+    try { recognition.start(); recognitionRef.current = recognition; setRecording(true) }
+    catch { setVoiceError('Mikrofon belum dapat dimulai. Coba lagi atau ketik jawabanmu.') }
   }
 
   const focus = session?.indicators.map(f => ({concept:f.name, state:'Menunggu tinjauan'})) ?? []
@@ -162,8 +226,8 @@ export default function Assessment({ path, id }: { path: string; id: string }) {
         </div>
       </div>
       <div className="mb-6 max-w-[880px]"><Stepper stage={Math.min(stage, 3)} /></div>
-      {error && <p role="alert" className="mb-4 rounded-lg bg-mist p-3">{error} <button className="underline text-plum" onClick={() => window.location.reload()}>Muat ulang</button></p>}
-      {serverMode && <p className="mb-4 text-[13px] text-muted">{serverMode === 'scripted' ? 'Mode skrip · respons contoh' : 'Mode AI langsung'}{fallback ? ' · menggunakan respons cadangan' : ''}</p>}
+      {error && <p role="alert" className="mb-4 rounded-lg bg-mist p-3">{error}{' '}{recovery === 'retry' ? <button className="underline text-plum disabled:opacity-50" disabled={busy || (stage === 0 ? !practiceReady : !canSendAnswer)} onClick={() => stage === 0 ? void beginBoby() : void send(true)}>Coba lagi</button> : recovery === 'reload' ? <button className="underline text-plum" onClick={() => window.location.reload()}>Muat ulang</button> : null}</p>}
+      {serverMode && <p className="mb-4 text-[13px] text-muted">{serverMode === 'scripted' ? 'Mode skrip · respons contoh' : 'Mode AI langsung'}{fallback ? stage === 3 ? ' · analisis cadangan' : ' · respons contoh' : ''}</p>}
 
       <div className="grid xl:grid-cols-[1fr_320px] gap-4 items-start">
         <div key={stage} className={dir === 'fwd' ? 't-step-fwd' : 't-step-back'}>
@@ -186,7 +250,7 @@ export default function Assessment({ path, id }: { path: string; id: string }) {
                   ))}
                 </ul>
                 <div className="mt-6 flex justify-end">
-                  <button className="btn btn-primary" disabled={busy || !!error || code.trim().length <= 20 || explain.trim().length < MIN} onClick={() => void beginBoby()}>{busy ? 'Menyiapkan Boby…' : 'Kirim dan lanjut ke Boby'} <ArrowRight size={16} aria-hidden="true" /></button>
+                  <button className="btn btn-primary" disabled={busy || !!error || !practiceReady} onClick={() => void beginBoby()}>{busy ? 'Menyiapkan Boby…' : 'Kirim dan lanjut ke Boby'} <ArrowRight size={16} aria-hidden="true" /></button>
                 </div>
               </section>
             </div>
@@ -213,7 +277,7 @@ export default function Assessment({ path, id }: { path: string; id: string }) {
                 ) : (
                   <div key={i} className="flex justify-end t-reveal">
                     <div className="bubble-right bg-charcoal text-ivory px-4 py-3 text-[15px] leading-snug max-w-[80%]">
-                      {(m.choice || m.voice) && <span className="block text-[13px] font-semibold text-[#CBB6FF] mb-1">{[m.choice, m.voice && 'jawaban contoh simulasi suara'].filter(Boolean).join(' · ')}</span>}
+                      {(m.choice || m.voice) && <span className="block text-[13px] font-semibold text-[#CBB6FF] mb-1">{[m.choice, m.voice && 'jawaban suara'].filter(Boolean).join(' · ')}</span>}
                       {m.text}
                     </div>
                   </div>
@@ -232,7 +296,7 @@ export default function Assessment({ path, id }: { path: string; id: string }) {
                 ) : (
                   <>
                     <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
-                      <Tabs label="Cara menjawab" value={mode} onChange={setMode} tabs={[{ id: 'teks', label: <span className="inline-flex items-center gap-1.5"><Keyboard size={15} aria-hidden="true" />Teks</span> }, ...(id === demoTask.id ? [{ id: 'suara' as const, label: <span className="inline-flex items-center gap-1.5"><Mic size={15} aria-hidden="true" />Suara (simulasi)</span> }] : [])]} />
+                      <Tabs label="Cara menjawab" value={mode} onChange={(next) => { if (recording && next !== 'suara') { setFinalizingVoice(true); recognitionRef.current?.stop() } setMode(next) }} tabs={[{ id: 'teks', label: <span className="inline-flex items-center gap-1.5"><Keyboard size={15} aria-hidden="true" />Teks</span> }, ...(id === demoTask.id ? [{ id: 'suara' as const, label: <span className="inline-flex items-center gap-1.5"><Mic size={15} aria-hidden="true" />Suara</span> }] : [])]} />
                       {onTrap && (
                         <div role="radiogroup" aria-label="Pilih sikapmu terhadap pernyataan Boby" className="flex gap-1.5">
                           {['Setuju', 'Tidak setuju'].map((c) => (
@@ -243,26 +307,26 @@ export default function Assessment({ path, id }: { path: string; id: string }) {
                     </div>
                     {mode === 'suara' && id === demoTask.id && (
                       <div className="mb-3 flex items-center gap-4 rounded-lg bg-mist p-3">
-                        <button onClick={record} className={`w-12 h-12 rounded-full grid place-content-center shrink-0 transition-colors duration-[250ms] ${recording ? 'bg-accent text-white' : 'bg-charcoal text-ivory hover:bg-black'}`} aria-label={recording ? 'Sedang merekam' : 'Mulai rekam jawaban'}>
+                        <button onClick={record} disabled={finalizingVoice || busy} aria-pressed={recording} className={`w-12 h-12 rounded-full grid place-content-center shrink-0 transition-colors duration-[250ms] disabled:opacity-60 ${recording ? 'bg-accent text-white' : 'bg-charcoal text-ivory hover:bg-black'}`} aria-label={finalizingVoice ? 'Memproses transkripsi' : recording ? 'Selesai merekam' : 'Mulai rekam jawaban'}>
                           {recording ? <Square size={16} fill="currentColor" /> : <Mic size={20} />}
                         </button>
-                        {recording ? (
+                        {recording && !finalizingVoice ? (
                           <div className="flex items-center gap-[3px] h-8" aria-hidden="true">
                             {Array.from({ length: 28 }, (_, i) => <span key={i} className="wave w-[3px] rounded-full bg-accent" style={{ animationDelay: `${(i % 7) * 90}ms`, height: `${30 + ((i * 37) % 60)}%` }} />)}
                           </div>
-                        ) : <p className="text-[15px] text-[#4E4B5E]">Simulasi suara: tombol mengisi jawaban contoh, belum merekam atau mentranskripsi suara.</p>}
+                        ) : <p className="text-[15px] text-[#4E4B5E]">{finalizingVoice ? 'Menyelesaikan transkripsi…' : 'Tekan mikrofon, bicara, lalu tekan lagi untuk melihat transkrip.'}</p>}
                       </div>
                     )}
+                    {mode === 'suara' && voiceError && <p role="alert" className="mb-3 text-[13px] text-[#A04242]">{voiceError}</p>}
                     <label htmlFor="jawab-boby" className="sr-only">Jawabanmu untuk Boby</label>
                     <textarea id="jawab-boby" className="field bubble-right" rows={3} value={draft} onChange={(e) => setDraft(e.target.value)}
                       onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) send() }}
                       placeholder={onTrap ? 'Pilih setuju atau tidak, lalu jelaskan alasanmu…' : 'Jelaskan dengan kata-katamu sendiri…'} aria-describedby="jawab-hint" />
                     <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
                       <p id="jawab-hint" className="text-[13px] text-muted tnum">
-                        {fromVoice ? 'Jawaban contoh dari simulasi suara: periksa sebelum mengirim. ' : ''}{Math.min(draft.trim().length, MIN)}/{MIN} karakter minimum{onTrap && !choice ? ' · pilih setuju atau tidak' : ''}
+                        {fromVoice ? 'Transkrip suara: periksa sebelum mengirim. ' : ''}{Math.min(draft.trim().length, MIN)}/{MIN} karakter minimum{onTrap && !choice ? ' · pilih setuju atau tidak' : ''}
                       </p>
                       <div className="flex items-center gap-4">
-                        {id === demoTask.id && <button className="text-[15px] font-semibold text-plum hover:underline" onClick={() => { setDraft(demoTask.sample[answered]); if (onTrap) setChoice('Tidak setuju') }}>Pakai contoh jawaban</button>}
                         <button className="btn btn-primary btn-sm" disabled={!canSend || busy} onClick={() => void send()}>Kirim <Send size={15} aria-hidden="true" /></button>
                       </div>
                     </div>
@@ -285,7 +349,6 @@ export default function Assessment({ path, id }: { path: string; id: string }) {
               <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
                 <button className="btn btn-ghost btn-sm" onClick={() => go(1)}><ArrowLeft size={15} aria-hidden="true" /> Kembali ke klarifikasi</button>
                 <div className="flex items-center gap-4">
-                  {id === demoTask.id && <button className="text-[15px] font-semibold text-plum hover:underline" onClick={() => setApply(['Queue, karena penelepon yang menunggu paling lama harus dijawab lebih dulu.', 'Stack. Kembali pertama membuka halaman terakhir, Kembali kedua membuka halaman sebelumnya.'])}>Pakai contoh jawaban</button>}
                   <button className="btn btn-primary" disabled={busy || !!error || apply.some((a) => a.trim().length < MIN)} onClick={() => void submitAll()}>{busy ? 'Mengirim…' : 'Kirim semua jawaban'} <Send size={16} aria-hidden="true" /></button>
                 </div>
               </div>

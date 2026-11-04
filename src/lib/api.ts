@@ -1,3 +1,6 @@
+import { ApiRequestError } from './api-errors'
+export { ApiRequestError } from './api-errors'
+
 export type Role = 'mahasiswa' | 'dosen'
 export type ApiStatus = 'terpenuhi' | 'sebagian' | 'belum' | 'ambigu'
 export type Turn = { who: 'boby' | 'mhs'; text: string; trap?: boolean; choice?: 'Setuju' | 'Tidak setuju'; time?: string }
@@ -24,7 +27,7 @@ async function request<T>(path:string, options:RequestInit = {}, token?:string):
   const body = await response.json().catch(() => null)
   if (!response.ok) {
     if (response.status === 401) { sessionStorage.removeItem(tokenKey('mahasiswa')); sessionStorage.removeItem(tokenKey('dosen')) }
-    throw new Error(body?.error?.message || `Permintaan gagal (${response.status}).`)
+    throw new ApiRequestError(response.status, body?.error?.code || 'http_error', body?.error?.message || `Permintaan gagal (${response.status}).`)
   }
   return body as T
 }
